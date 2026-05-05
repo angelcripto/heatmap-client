@@ -161,6 +161,170 @@ final class Client
         return (new self($licenseKey, $hmacSecret))->getSignedUrl($path);
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    // ═══ MODO SERVER-TO-SERVER (S2S) ════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════════════
+    // Los métodos fetch* hacen la llamada HTTP directamente desde tu backend.
+    // La IP que llega al Búnker es la fija de tu server, así que la license
+    // tiene que tener tu IP en allowed_ips. NO se manda header Origin (cURL
+    // no lo pone), por lo que el server detecta modo S2S y valida solo IP.
+    //
+    // Casos de uso típicos:
+    //   - Cachear data del heatmap server-side y servirla a tus usuarios.
+    //   - Procesar/agregar los datos antes de enseñarlos.
+    //   - Generar reportes/exports/PDF con los datos del heatmap.
+    //   - Alertas internas basadas en los datos sin tener un browser delante.
+    //
+    // Si lo que quieres es montar el embed JS en una página web, NO uses
+    // fetch* — usa signRequest() y devuelve la URL al browser para que
+    // haga el fetch él mismo (modo embed, valida origin no IP).
+
+    /**
+     * Hace una llamada server-to-server al heatmap CDN y devuelve la respuesta
+     * JSON ya decodificada como array.
+     *
+     * @param string $path    Path con querystring, ej: "/api/heatmap/oi-history?symbol=BTCUSDT&interval=5m"
+     * @param string $method  Default "GET" — el heatmap solo acepta GET ahora mismo
+     * @param string $body    Body raw para POST/PUT (vacío para GET)
+     * @param int $timeoutSec Timeout total de la request (default 15s)
+     *
+     * @return array  Respuesta del Búnker decodificada de JSON
+     * @throws HeatmapException si la response no es 2xx o no es JSON válido
+     * @throws \RuntimeException si la extensión cURL no está disponible
+     */
+    public function fetch(string $path, string $method = 'GET', string $body = '', int $timeoutSec = 15): array
+    {
+        $resp = $this->fetchResponse($path, $method, $body, $timeoutSec);
+        $data = json_decode($resp['body'], true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new HeatmapException(
+                'Response del Búnker no es JSON válido: ' . json_last_error_msg(),
+                $resp['status'], null, null, $resp['body']
+            );
+        }
+        return is_array($data) ? $data : [];
+    }
+
+    /**
+     * Igual que fetch() pero devuelve el cuerpo CRUDO (string JSON sin parsear).
+     * Útil cuando vas a re-emitir la respuesta tal cual a tu propio cliente
+     * (proxy transparente sin tocar la estructura).
+     *
+     * @throws HeatmapException si la response no es 2xx
+     */
+    public function fetchRaw(string $path, string $method = 'GET', string $body = '', int $timeoutSec = 15): string
+    {
+        return $this->fetchResponse($path, $method, $body, $timeoutSec)['body'];
+    }
+
+    /**
+     * Versión más completa: devuelve status + headers + body. Lanza excepción
+     * solo si hubo error de red o el server rechazó con 4xx/5xx con un body
+     * que parece JSON con campo "error". Si quieres procesar 4xx tú mismo
+     * sin excepción, usa esta versión y mira $resp['status'].
+     *
+     * @return array{status:int, headers:array<string,string>, body:string}
+     * @throws HeatmapException si error de red o el server devolvió error semántico
+     * @throws \RuntimeException si cURL no está disponible
+     */
+    public function fetchResponse(string $path, string $method = 'GET', string $body = '', int $timeoutSec = 15): array
+    {
+        if (!function_exists('curl_init')) {
+            throw new \RuntimeException('La extensión PHP cURL es requerida para llamadas server-to-server. Instálala (apt install php-curl en Debian/Ubuntu, o pkg-instálala en otro OS) y reinicia PHP.');
+        }
+        if ($path === '' || strpos($path, self::ALLOWED_PATH_PREFIX) !== 0) {
+            throw new \InvalidArgumentException(
+                'path debe empezar por "' . self::ALLOWED_PATH_PREFIX . '". Recibido: "' . $path . '".'
+            );
+        }
+
+        $signed = $this->signRequest($path, $method, $body);
+        $url    = $signed->getUrl();
+
+        $ch = curl_init();
+        $headers = ['Accept: application/json'];
+        if ($body !== '') {
+            $headers[] = 'Content-Type: application/json';
+        }
+        // Importante: NO mandamos Origin. El server lo usa como pista de
+        // "modo S2S" (cURL no manda Origin → valida IP no origin).
+
+        curl_setopt_array($ch, [
+            CURLOPT_URL            => $url,
+            CURLOPT_CUSTOMREQUEST  => strtoupper($method),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HEADER         => true,  // incluye headers en el output para parsearlos
+            CURLOPT_HTTPHEADER     => $headers,
+            CURLOPT_TIMEOUT        => $timeoutSec,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_USERAGENT      => 'elbunkerbitcoin/heatmap-client (PHP)',
+        ]);
+        if ($body !== '') {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+        }
+
+        $raw         = curl_exec($ch);
+        $errno       = curl_errno($ch);
+        $errMsg      = curl_error($ch);
+        $status      = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $headerSize  = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+        curl_close($ch);
+
+        if ($errno !== 0 || $raw === false) {
+            throw new HeatmapException(
+                'Error de red llamando al Búnker: ' . $errMsg,
+                0, 'network_error', null, ''
+            );
+        }
+
+        $rawHeaders  = substr((string) $raw, 0, $headerSize);
+        $respBody    = substr((string) $raw, $headerSize);
+        $headersOut  = self::parseHeaders($rawHeaders);
+
+        if ($status < 200 || $status >= 300) {
+            // Intentamos extraer error/detail del body si es JSON
+            $errCode = null; $errDetail = null;
+            $maybeJson = json_decode($respBody, true);
+            if (is_array($maybeJson)) {
+                $errCode   = isset($maybeJson['error'])  ? (string) $maybeJson['error']  : null;
+                $errDetail = isset($maybeJson['detail']) && is_array($maybeJson['detail']) ? $maybeJson['detail'] : null;
+            }
+            throw new HeatmapException(
+                'Búnker devolvió HTTP ' . $status . ($errCode ? ' — ' . $errCode : ''),
+                $status, $errCode, $errDetail, $respBody
+            );
+        }
+
+        return [
+            'status'  => $status,
+            'headers' => $headersOut,
+            'body'    => $respBody,
+        ];
+    }
+
+    /**
+     * Parser básico de headers HTTP de la respuesta cruda de cURL.
+     * Maneja respuestas con múltiples bloques de headers (redirects → 100 Continue → 200).
+     * Devolvemos solo el último bloque, que es el de la respuesta final.
+     *
+     * @return array<string,string>
+     */
+    private static function parseHeaders(string $raw): array
+    {
+        $blocks = preg_split("/\r?\n\r?\n/", trim($raw)) ?: [];
+        $last   = end($blocks) ?: '';
+        $out    = [];
+        foreach (preg_split("/\r?\n/", $last) ?: [] as $line) {
+            if (strpos($line, ':') === false) continue; // salta status line
+            [$k, $v] = explode(':', $line, 2);
+            $out[strtolower(trim($k))] = trim($v);
+        }
+        return $out;
+    }
+
     /** Devuelve la license_key configurada (segura de exponer, es pública). */
     public function getLicenseKey(): string
     {
