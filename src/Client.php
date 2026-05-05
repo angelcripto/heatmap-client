@@ -104,11 +104,22 @@ final class Client
      *                      pasa esto desde signEndpoint.
      * @param string $method  GET, POST, etc. Default GET (el heatmap solo usa GETs ahora mismo).
      * @param string $body    Body raw para POST/PUT. Vacío para GET.
+     * @param int|null $bunkerUserId  ID del usuario en el Búnker que está
+     *                      consumiendo el heatmap. Obligatorio si la license
+     *                      tiene require_user_session=1 (caso típico: Omega
+     *                      linkea sus users con cuentas del Búnker, y solo
+     *                      los que pagan el plugin pueden ver el mapa). El
+     *                      ID se incluye DENTRO del payload firmado, así no
+     *                      puede manipularse desde el browser.
      *
      * @throws InvalidArgumentException si el path no empieza por /api/heatmap/.
      */
-    public function signRequest(string $path, string $method = 'GET', string $body = ''): SignedRequest
-    {
+    public function signRequest(
+        string $path,
+        string $method = 'GET',
+        string $body = '',
+        ?int $bunkerUserId = null
+    ): SignedRequest {
         if ($path === '' || strpos($path, self::ALLOWED_PATH_PREFIX) !== 0) {
             throw new InvalidArgumentException(
                 'path debe empezar por "' . self::ALLOWED_PATH_PREFIX . '". Recibido: "' . $path . '". '
@@ -120,23 +131,32 @@ final class Client
         $ts     = (string) time();
         $nonce  = bin2hex(random_bytes(self::NONCE_BYTES));
 
-        // Payload firmado: ts.nonce.METHOD.path.body
-        // El "path" aquí es el path original SIN los 4 query params de auth
-        // (los añadimos después). Si los incluyéramos en el payload, sería
-        // circular: la firma dependería de sí misma.
-        $payload = $ts . '.' . $nonce . '.' . $method . '.' . $path . '.' . $body;
+        // Si va bunkerUserId, lo añadimos al path ANTES de firmar. El server
+        // lee _bk_user del querystring y lo incluye en el cleanPath que
+        // reconstruye para verificar. Si alguien intercepta la URL final y
+        // cambia _bk_user, la firma deja de validar.
+        $pathToSign = $path;
+        if ($bunkerUserId !== null && $bunkerUserId > 0) {
+            $sep = (strpos($pathToSign, '?') === false) ? '?' : '&';
+            $pathToSign .= $sep . '_bk_user=' . $bunkerUserId;
+        }
+
+        // Payload firmado: ts.nonce.METHOD.pathToSign.body
+        // pathToSign INCLUYE _bk_user pero NO los 4 params de auth (los
+        // añadimos después de firmar — si los incluyéramos sería circular).
+        $payload = $ts . '.' . $nonce . '.' . $method . '.' . $pathToSign . '.' . $body;
         $sig     = hash_hmac('sha256', $payload, $this->hmacSecret);
 
-        // Construimos la URL final añadiendo los 4 params de auth como
-        // querystring extra. Soportamos paths que ya tengan ? o que no.
-        $sep = (strpos($path, '?') === false) ? '?' : '&';
+        // Construimos la URL final: pathToSign (que ya tiene _bk_user) +
+        // los 4 params auth. Soportamos paths que ya tengan ? o que no.
+        $sep = (strpos($pathToSign, '?') === false) ? '?' : '&';
         $authQs = $sep
                 . '_bk_lic='   . rawurlencode($this->licenseKey)
                 . '&_bk_ts='   . rawurlencode($ts)
                 . '&_bk_nonce='. rawurlencode($nonce)
                 . '&_bk_sig='  . rawurlencode($sig);
 
-        $signedUrl = $this->baseUrl . $path . $authQs;
+        $signedUrl = $this->baseUrl . $pathToSign . $authQs;
 
         return new SignedRequest($signedUrl, (int) $ts, 60);
     }
@@ -147,18 +167,18 @@ final class Client
      *
      *     $url = (new Client($key, $secret))->getSignedUrl('/api/heatmap/...');
      */
-    public function getSignedUrl(string $path, string $method = 'GET', string $body = ''): string
+    public function getSignedUrl(string $path, string $method = 'GET', string $body = '', ?int $bunkerUserId = null): string
     {
-        return $this->signRequest($path, $method, $body)->getUrl();
+        return $this->signRequest($path, $method, $body, $bunkerUserId)->getUrl();
     }
 
     /**
      * Helper estático para flujos one-shot. NO usarlo si vas a firmar muchas
      * requests — instancia el Client una vez y reusa.
      */
-    public static function quickSign(string $licenseKey, string $hmacSecret, string $path): string
+    public static function quickSign(string $licenseKey, string $hmacSecret, string $path, ?int $bunkerUserId = null): string
     {
-        return (new self($licenseKey, $hmacSecret))->getSignedUrl($path);
+        return (new self($licenseKey, $hmacSecret))->getSignedUrl($path, 'GET', '', $bunkerUserId);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -192,9 +212,9 @@ final class Client
      * @throws HeatmapException si la response no es 2xx o no es JSON válido
      * @throws \RuntimeException si la extensión cURL no está disponible
      */
-    public function fetch(string $path, string $method = 'GET', string $body = '', int $timeoutSec = 15): array
+    public function fetch(string $path, string $method = 'GET', string $body = '', int $timeoutSec = 15, ?int $bunkerUserId = null): array
     {
-        $resp = $this->fetchResponse($path, $method, $body, $timeoutSec);
+        $resp = $this->fetchResponse($path, $method, $body, $timeoutSec, $bunkerUserId);
         $data = json_decode($resp['body'], true);
         if (json_last_error() !== JSON_ERROR_NONE) {
             throw new HeatmapException(
@@ -212,9 +232,9 @@ final class Client
      *
      * @throws HeatmapException si la response no es 2xx
      */
-    public function fetchRaw(string $path, string $method = 'GET', string $body = '', int $timeoutSec = 15): string
+    public function fetchRaw(string $path, string $method = 'GET', string $body = '', int $timeoutSec = 15, ?int $bunkerUserId = null): string
     {
-        return $this->fetchResponse($path, $method, $body, $timeoutSec)['body'];
+        return $this->fetchResponse($path, $method, $body, $timeoutSec, $bunkerUserId)['body'];
     }
 
     /**
@@ -227,7 +247,7 @@ final class Client
      * @throws HeatmapException si error de red o el server devolvió error semántico
      * @throws \RuntimeException si cURL no está disponible
      */
-    public function fetchResponse(string $path, string $method = 'GET', string $body = '', int $timeoutSec = 15): array
+    public function fetchResponse(string $path, string $method = 'GET', string $body = '', int $timeoutSec = 15, ?int $bunkerUserId = null): array
     {
         if (!function_exists('curl_init')) {
             throw new \RuntimeException('La extensión PHP cURL es requerida para llamadas server-to-server. Instálala (apt install php-curl en Debian/Ubuntu, o pkg-instálala en otro OS) y reinicia PHP.');
@@ -238,7 +258,7 @@ final class Client
             );
         }
 
-        $signed = $this->signRequest($path, $method, $body);
+        $signed = $this->signRequest($path, $method, $body, $bunkerUserId);
         $url    = $signed->getUrl();
 
         $ch = curl_init();
