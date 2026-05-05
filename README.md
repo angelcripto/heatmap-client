@@ -21,8 +21,8 @@ composer require elbunkerbitcoin/heatmap-client
 
 2. Mete las dos en tu `.env`:
    ```dotenv
-   BUNKER_LICENSE_KEY=647d4ae9dc41e01aef34f366a4130c9322fba01cf5cc58ca
-   BUNKER_HMAC_SECRET=c313b44a26fee86eaa4323ab37f8498b9e10bad429d1c7925fcf13157159fca9a25e26dc9ff45bc5ebdb9ca148e3dece
+   BUNKER_LICENSE_KEY=tu_license_key_aqui
+   BUNKER_HMAC_SECRET=tu_hmac_secret_aqui
    ```
 
 ## Uso
