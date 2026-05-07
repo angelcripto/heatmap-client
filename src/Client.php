@@ -44,8 +44,8 @@ use InvalidArgumentException;
  */
 final class Client
 {
-    /** Path prefix que aceptamos firmar. No firmamos paths arbitrarios. */
-    private const ALLOWED_PATH_PREFIX = '/api/heatmap/';
+    /** Path prefixes que aceptamos firmar. No firmamos paths arbitrarios. */
+    private const ALLOWED_PATH_PREFIXES = ['/api/heatmap/', '/api/omega/'];
 
     /** Default base URL del Búnker. Sobrescribir solo en testing. */
     public const DEFAULT_BASE_URL = 'https://elbunkerbitcoin.com';
@@ -120,9 +120,9 @@ final class Client
         string $body = '',
         ?int $bunkerUserId = null
     ): SignedRequest {
-        if ($path === '' || strpos($path, self::ALLOWED_PATH_PREFIX) !== 0) {
+        if (!self::pathHasAllowedPrefix($path)) {
             throw new InvalidArgumentException(
-                'path debe empezar por "' . self::ALLOWED_PATH_PREFIX . '". Recibido: "' . $path . '". '
+                'path debe empezar por uno de: ' . implode(', ', self::ALLOWED_PATH_PREFIXES) . '. Recibido: "' . $path . '". '
                 . 'Esto previene que un cliente malicioso use tu firmador como "oracle" para firmar URLs arbitrarias del Búnker.'
             );
         }
@@ -252,9 +252,9 @@ final class Client
         if (!function_exists('curl_init')) {
             throw new \RuntimeException('La extensión PHP cURL es requerida para llamadas server-to-server. Instálala (apt install php-curl en Debian/Ubuntu, o pkg-instálala en otro OS) y reinicia PHP.');
         }
-        if ($path === '' || strpos($path, self::ALLOWED_PATH_PREFIX) !== 0) {
+        if (!self::pathHasAllowedPrefix($path)) {
             throw new \InvalidArgumentException(
-                'path debe empezar por "' . self::ALLOWED_PATH_PREFIX . '". Recibido: "' . $path . '".'
+                'path debe empezar por uno de: ' . implode(', ', self::ALLOWED_PATH_PREFIXES) . '. Recibido: "' . $path . '".'
             );
         }
 
@@ -355,5 +355,15 @@ final class Client
     public function getBaseUrl(): string
     {
         return $this->baseUrl;
+    }
+
+    /** True si el path empieza por alguno de los prefixes permitidos. */
+    private static function pathHasAllowedPrefix(string $path): bool
+    {
+        if ($path === '') return false;
+        foreach (self::ALLOWED_PATH_PREFIXES as $prefix) {
+            if (strpos($path, $prefix) === 0) return true;
+        }
+        return false;
     }
 }
